@@ -1,4 +1,3 @@
-
 from functools import partial
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
@@ -22,7 +21,6 @@ class PrefixTuningTemplate(Template):
     This implementation modifies the huggingface's T5 forward without touching the code-base.
     However, it may fail to work when used in DataParallel model. Please use it using
     single gpu or model-parallel training.
-
     Args:
         model (:obj:`PreTrainedModel`): The pre-trained model.
         plm_config (:obj:`PretrainedConfig`): The configuration of the current pre-trained model.
@@ -46,6 +44,7 @@ class PrefixTuningTemplate(Template):
                  mid_dim: Optional[int] =  512,
                  using_encoder_past_key_values: Optional[bool] = True,
                  using_decoder_past_key_values: Optional[bool] = True,
+                 using_cross: Optional[bool] = True
                 ):
         super().__init__(tokenizer=tokenizer,
                          placeholder_mapping=placeholder_mapping)
@@ -54,7 +53,8 @@ class PrefixTuningTemplate(Template):
         self.mapping_hook = mapping_hook
         self.embedding_size = raw_embedding.weight.shape[-1]
         self.num_token = num_token
-
+        
+        self.using_cross = using_cross
         self.using_encoder_past_key_values = using_encoder_past_key_values
         self.using_decoder_past_key_values = using_decoder_past_key_values
         assert (self.using_encoder_past_key_values or self.using_decoder_past_key_values), "Can't be both False."
@@ -98,6 +98,12 @@ class PrefixTuningTemplate(Template):
     def get_past_key_values(self, batch_size=1):
         pvs = []
         if self.config.is_encoder_decoder and self.using_encoder_past_key_values:
+
+            '''temp=nn.functional.normalize(self.wte.weight,dim=-1)
+            temp=temp.sum(dim=0)
+            temp=temp*temp
+            self.loss = temp.sum()-self.num_token'''
+
             input_tokens = self.input_tokens.unsqueeze(0).expand(batch_size, -1)
             temp_control = self.wte(input_tokens)
             past_key_values = self.control_trans(temp_control) #bsz, seqlen, layer*emb
@@ -111,6 +117,12 @@ class PrefixTuningTemplate(Template):
             pvs.append(None)
 
         if (not self.config.is_encoder_decoder) or self.using_decoder_past_key_values:
+
+            '''temp=nn.functional.normalize(self.decoder_wte.weight,dim=-1)
+            temp=temp.sum(dim=0)
+            temp=temp*temp
+            self.loss1 = temp.sum()-self.num_token'''
+
             decoder_input_tokens = self.input_tokens.unsqueeze(0).expand(batch_size, -1)
             decoder_temp_control = self.decoder_wte(decoder_input_tokens)
             decoder_past_key_values = self.decoder_control_trans(decoder_temp_control) #bsz, seqlen, layer*emb
@@ -120,6 +132,20 @@ class PrefixTuningTemplate(Template):
             decoder_past_key_values = self.dropout(decoder_past_key_values)
             decoder_past_key_values = decoder_past_key_values.permute([2, 0, 3, 1, 4]).split(2)
             pvs.append(decoder_past_key_values)
+
+        
+        if  (not self.config.is_encoder_decoder) or self.using_cross:
+            cross_input_tokens = self.input_tokens.unsqueeze(0).expand(batch_size, -1)
+            cross_temp_control = self.cross_wte(cross_input_tokens)
+            cross_past_key_values = self.cross_control_trans(cross_temp_control) #bsz, seqlen, layer*emb
+            _, cross_seqlen, _ = cross_past_key_values.shape
+            cross_past_key_values = cross_past_key_values.view(batch_size, cross_seqlen, self.match_n_decoder_layer * 2, self.match_n_head,
+                                                self.match_n_embd)
+            cross_past_key_values = self.dropout(cross_past_key_values)
+            cross_past_key_values = cross_past_key_values.permute([2, 0, 3, 1, 4]).split(2)
+            pvs.append(cross_past_key_values)
+
+
         else:
             pvs.append(None)
         return pvs
@@ -148,6 +174,14 @@ class PrefixTuningTemplate(Template):
             # nn.Tanh(),
             nn.Linear(self.mid_dim, self.n_decoder_layer * 2 * self.n_embd))
 
+        if  (not self.config.is_encoder_decoder) or self.using_cross:
+            self.cross_wte = nn.Embedding(self.num_token, self.n_embd)
+            self.cross_control_trans = nn.Sequential(
+            nn.Linear(self.n_embd, self.mid_dim),
+            nn.Tanh(),
+            # nn.Linear(self.mid_dim, self.mid_dim),
+            # nn.Tanh(),
+            nn.Linear(self.mid_dim, self.n_decoder_layer * 2 * self.n_embd))
 
     def wrap_one_example(self, example) -> List[Dict]:
         if self.text is None:
@@ -228,10 +262,43 @@ class PrefixTuningTemplate(Template):
                         return backup_decoder_self_attn_forward_functions[layer_id](*args, **kwargs)
                     layer_module.layer[0].forward = partial(modified_decoder_self_attn_forward, layer_id=i)
 
+            if True:
+                backup_cross_self_attn_forward_functions = []
+                for i, layer_module in enumerate(model.decoder.block):
+                    # print(layer_module.layer[1])
+                    backup_cross_self_attn_forward_functions.append(layer_module.layer[1].forward)
+                    def modified_cross_self_attn_forward(*args, **kwargs):
+                        # print('len',len(args),len(kwargs))
+                        # for keys in kwargs: print(keys)
+                        batch_size = args[0].shape[0]
+                        layer_id = kwargs.pop('layer_id')
+                        device = args[0].device
+                        # print(len(kwargs))
+                        # print(args[0].shape,kwargs['attention_mask'].shape)
+                        #if kwargs['past_key_value'] is not None and model.eval():
+                            #print(kwargs['past_key_value'][0].shape,kwargs['attention_mask'].shape)
+                        kwargs['past_key_value']=None
+                        if not self.using_cross: return backup_cross_self_attn_forward_functions[layer_id](*args, **kwargs)
+                        if kwargs['past_key_value'] is None:
+                            kwargs['past_key_value'] = self.expand_to_batchsize_for_layer(self.past_key_values[2], batch_size, layer_id).to(device)
+                            #if model.eval(): print(kwargs['past_key_value'][0].shape)
+
+                        if kwargs['past_key_value'][0].size(-2) + kwargs['key_value_states'].size(-2) == kwargs['attention_mask'].size(-1):
+                            pass
+                        elif kwargs['past_key_value'][0].size(-2) + kwargs['key_value_states'].size(-2) == kwargs['attention_mask'].size(-1) +self.num_token:
+                            # print(kwargs['past_key_value'])
+                            am = kwargs['attention_mask']
+                            kwargs['attention_mask'] = torch.cat([torch.zeros((*am.shape[:-1],self.num_token), dtype = am.dtype,device=am.device), am], dim=-1)
+                        else:
+                            raise RuntimeError("Size not match: past length: {}, inputlength:{},\
+                                attention mask length {}".format(kwargs['past_key_value'][0].size(-2),
+                                kwargs['key_value_states'].size(-2),kwargs['attention_mask'].size(-1)))
+
+                        return backup_cross_self_attn_forward_functions[layer_id](*args, **kwargs)
+                    layer_module.layer[1].forward = partial(modified_cross_self_attn_forward, layer_id=i)
+
         elif isinstance(model, GPT2LMHeadModel):
             pass
         else:
             raise NotImplementedError
         self.plm_modified = True
-
-
